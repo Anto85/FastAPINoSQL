@@ -1,0 +1,4 @@
+fastapi==0.109.2
+pydantic==2.8.0
+pymongo==4.6.0
+bson==0.5.10

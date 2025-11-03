@@ -1,196 +1,225 @@
-from typing import Optional, Any, Dict
-
-from fastapi import FastAPI, HTTPException, Body, Query, Request, Response, status
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Dict, Optional
+from bson import ObjectId
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict
 from pymongo import MongoClient
-from pymongo.errors import ServerSelectionTimeoutError, DuplicateKeyError
-from bson import ObjectId
-from contextlib import asynccontextmanager
+from pymongo.errors import DuplicateKeyError, ServerSelectionTimeoutError
+
 
 def _doc_to_dict(doc: Dict[str, Any]) -> Dict[str, Any]:
-	"""Convert a MongoDB document to a JSON-serializable dict."""
-	if not doc:
-		return doc
-	doc = dict(doc)
-	_id = doc.get("_id")
-	if isinstance(_id, ObjectId):
-		doc["_id"] = str(_id)
-	return doc
+    if not doc:
+        return doc
+    doc = dict(doc)
+    document_id = doc.get("_id")
+    if isinstance(document_id, ObjectId):
+        doc["_id"] = str(document_id)
+    return doc
 
+
+def _normalize_object_id(value: str) -> Any:
+    try:
+        return ObjectId(value)
+    except Exception:
+        return value
+
+
+def _build_search_filter(params: Dict[str, str]) -> Dict[str, Any]:
+    clauses = []
+    for key, value in params.items():
+        if key == "name":
+            clauses.append(
+                {
+                    "$or": [
+                        {"first_name": {"$regex": value, "$options": "i"}},
+                        {"last_name": {"$regex": value, "$options": "i"}},
+                    ]
+                }
+            )
+        elif key == "_id":
+            clauses.append({"_id": _normalize_object_id(value)})
+        else:
+            clauses.append({key: {"$regex": value, "$options": "i"}})
+
+    if not clauses:
+        raise HTTPException(status_code=400, detail="Provide at least one query parameter to search")
+
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+def _parse_limit(raw_limit: Optional[str]) -> Optional[int]:
+    if raw_limit is None:
+        return None
+    try:
+        parsed = int(raw_limit)
+    except Exception as exc:  # FastAPI converts to str, any failure should surface
+        raise HTTPException(status_code=400, detail="Invalid limit value") from exc
+    return max(1, parsed)
+
+
+def _load_environment() -> None:
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except Exception:
+        load_dotenv = None
+
+    if load_dotenv:
+        load_dotenv()
+
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = [piece.strip() for piece in line.split("=", 1)]
+        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_environment()
+
+MONGO_HOST = os.getenv("MONGO_HOST", "localhost")
+try:
+    MONGO_PORT = int(os.getenv("MONGO_PORT", "27017"))
+except (TypeError, ValueError):
+    MONGO_PORT = 27017
+MONGO_DB = os.getenv("MONGO_DB", "crunchbase")
+MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "artistes")
+
+
+def get_db_client() -> MongoClient:
+    uri = f"mongodb://{MONGO_HOST}:{MONGO_PORT}"
+    client = MongoClient(uri, serverSelectionTimeoutMS=2000)
+    try:
+        client.admin.command("ping")
+    except ServerSelectionTimeoutError as exc:
+        raise RuntimeError(f"Could not connect to MongoDB at {uri}: {exc}") from exc
+    return client
+
+
+_client: Optional[MongoClient] = None
+
+
+def get_collection():
+    global _client
+    if _client is None:
+        _client = get_db_client()
+    return _client[MONGO_DB][MONGO_COLLECTION]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-	try:
-		yield
-	finally:
-		global _client
-		if _client is not None:
-			_client.close()
+    try:
+        yield
+    finally:
+        global _client
+        if _client is not None:
+            _client.close()
 
 
 app = FastAPI(title="Artists API", lifespan=lifespan)
 
-# MongoDB connection settings
-MONGO_HOST = "localhost"
-MONGO_PORT = 32768
-MONGO_DB = "crunchbase"
-MONGO_COLLECTION = "artistes"   
-
-def get_db_client() -> MongoClient:
-	uri = f"mongodb://{MONGO_HOST}:{MONGO_PORT}"
-	client = MongoClient(uri, serverSelectionTimeoutMS=2000)
-	try:
-		client.admin.command("ping")
-	except ServerSelectionTimeoutError as e:
-		raise RuntimeError(f"Could not connect to MongoDB at {uri}: {e}")
-	return client
-
-_client: Optional[MongoClient] = None
-
-def get_collection():
-	global _client
-	if _client is None:
-		_client = get_db_client()
-	db = _client[MONGO_DB]
-	return db[MONGO_COLLECTION]
 
 class ArtistUpdate(BaseModel):
-	model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="allow")
 
 
 class ArtistCreate(BaseModel):
-	model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="allow")
+
 
 @app.get("/artists")
 def list_artists(limit: int = Query(100, ge=1, le=1000)):
-	"""List all artists (paginated by `limit`)."""
-	coll = get_collection()
-	docs = coll.find().limit(limit)
-	items = [_doc_to_dict(d) for d in docs]
-	return {"count": len(items), "items": items}
+    coll = get_collection()
+    documents = coll.find().limit(limit)
+    items = [_doc_to_dict(document) for document in documents]
+    return {"count": len(items), "items": items}
+
 
 @app.get("/artists/search")
 def find_artist(request: Request):
-	"""Search artists by any attribute provided as query parameters.
+    params = dict(request.query_params)
+    raw_limit = params.pop("limit", None)
+    search_filter = _build_search_filter(params)
 
-	Behavior:
-	- `_id`: will be treated as an ObjectId when possible, otherwise as a string equality.
-	- `name`: will search `first_name` OR `last_name` (case-insensitive substring).
-	- Any other attribute: case-insensitive substring match via regex.
-	- Optional `limit` query param limits the number of returned items.
-	"""
-	coll = get_collection()
-	params = dict(request.query_params)
+    coll = get_collection()
+    cursor = coll.find(search_filter)
 
-	limit_val = params.pop("limit", None)
+    parsed_limit = _parse_limit(raw_limit)
+    if parsed_limit is not None:
+        cursor = cursor.limit(parsed_limit)
 
-	clauses = []
-	for k, v in params.items():
-		if k == "name":
-			clauses.append({"$or": [
-				{"first_name": {"$regex": v, "$options": "i"}},
-				{"last_name": {"$regex": v, "$options": "i"}}
-			]})
-		elif k == "_id":
-			try:
-				clauses.append({"_id": ObjectId(v)})
-			except Exception:
-				clauses.append({"_id": v})
-		else:
-			clauses.append({k: {"$regex": v, "$options": "i"}})
+    items = [_doc_to_dict(document) for document in cursor]
+    return {"count": len(items), "items": items}
 
-	if not clauses:
-		raise HTTPException(status_code=400, detail="Provide at least one query parameter to search")
-
-	if len(clauses) == 1:
-		mongo_filter = clauses[0]
-	else:
-		mongo_filter = {"$and": clauses}
-
-	cursor = coll.find(mongo_filter)
-	if limit_val is not None:
-		try:
-			n = int(limit_val)
-			cursor = cursor.limit(max(1, n))
-		except Exception:
-			raise HTTPException(status_code=400, detail="Invalid limit value")
-
-	items = [_doc_to_dict(d) for d in cursor]
-	return {"count": len(items), "items": items}
 
 @app.put("/artists/{artist_id}")
 def update_artist(artist_id: str, payload: ArtistUpdate = Body(...)):
-	"""Update an artist document by _id using JSON body with fields to set.
+    coll = get_collection()
+    query_id = _normalize_object_id(artist_id)
 
-	The `_id` field cannot be changed.
-	"""
-	coll = get_collection()
-	try:
-		query_id = ObjectId(artist_id)
-	except Exception:
-		query_id = artist_id
+    body = payload.model_dump(exclude_unset=True)
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty update payload")
+    body.pop("_id", None)
 
-	body = payload.dict(exclude_unset=True)
-	if not body:
-		raise HTTPException(status_code=400, detail="Empty update payload")
-	if "_id" in body:
-		body.pop("_id")
+    result = coll.update_one({"_id": query_id}, {"$set": body})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Artist not found")
 
-	result = coll.update_one({"_id": query_id}, {"$set": body})
-	if result.matched_count == 0:
-		raise HTTPException(status_code=404, detail="Artist not found")
-
-	doc = coll.find_one({"_id": query_id})
-	return _doc_to_dict(doc)
+    document = coll.find_one({"_id": query_id})
+    return _doc_to_dict(document)
 
 
 @app.post("/artists", status_code=201)
 def create_artist(payload: ArtistCreate = Body(...)):
-	"""Create a new artist document. If `_id` is provided it will be used, otherwise MongoDB will create an ObjectId."""
-	coll = get_collection()
-	body = payload.model_dump()
-	if not body:
-		raise HTTPException(status_code=400, detail="Empty payload")
+    coll = get_collection()
+    body = payload.model_dump()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty payload")
 
-	try:
-		res = coll.insert_one(body)
-	except DuplicateKeyError:
-		raise HTTPException(status_code=409, detail="Artist with this _id already exists")
+    try:
+        result = coll.insert_one(body)
+    except DuplicateKeyError as exc:
+        raise HTTPException(status_code=409, detail="Artist with this _id already exists") from exc
 
-	inserted_id = res.inserted_id if hasattr(res, "inserted_id") else body.get("_id")
-	doc = coll.find_one({"_id": inserted_id})
-	return _doc_to_dict(doc)
+    inserted_id = getattr(result, "inserted_id", body.get("_id"))
+    document = coll.find_one({"_id": inserted_id})
+    return _doc_to_dict(document)
 
 
 @app.delete("/artists/{artist_id}", status_code=204)
 def delete_artist(artist_id: str):
-	"""Delete an artist by _id (ObjectId or string). Returns 204 on success."""
-	coll = get_collection()
-	try:
-		query_id = ObjectId(artist_id)
-	except Exception:
-		query_id = artist_id
+    coll = get_collection()
+    query_id = _normalize_object_id(artist_id)
 
-	res = coll.delete_one({"_id": query_id})
-	if res.deleted_count == 0:
-		raise HTTPException(status_code=404, detail="Artist not found")
-	return Response(status_code=status.HTTP_204_NO_CONTENT)
+    result = coll.delete_one({"_id": query_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Artist not found")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 
 @app.get("/artists/{artist_id}")
 def get_artist_by_id(artist_id: str):
-	"""Get a single artist by _id (path parameter)."""
-	coll = get_collection()
-	try:
-		query_id = ObjectId(artist_id)
-	except Exception:
-		query_id = artist_id
-	doc = coll.find_one({"_id": query_id})
-	if not doc:
-		raise HTTPException(status_code=404, detail="Artist not found")
-	return _doc_to_dict(doc)
+    coll = get_collection()
+    query_id = _normalize_object_id(artist_id)
+
+    document = coll.find_one({"_id": query_id})
+    if not document:
+        raise HTTPException(status_code=404, detail="Artist not found")
+    return _doc_to_dict(document)
+
 
 if __name__ == "__main__":
-	import uvicorn
+    import uvicorn
 
-	uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

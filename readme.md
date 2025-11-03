@@ -20,5 +20,6 @@ Endpoints disponibles:
 
 Tous les endpoints sont disponibles via l'url: http://localhost:8000/docs.
   
-
+Installation des packages
+-> pip install -r requirements.txt
 

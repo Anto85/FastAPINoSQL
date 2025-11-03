@@ -2,7 +2,7 @@ Prérequis:
 
 Python 3.12
 MongoDB
-Package Python: fastapi, uvicorn,pydantic,pymongo
+Package Python: fastapi, uvicorn,pydantic, pymongo
 
 1) Lancer mongodb.
 2) S'assurer que la base de données crunchbase et la collection artists existent.

@@ -5,7 +5,7 @@ MongoDB
 Package Python: fastapi, uvicorn
 
 1) Lancer mongodb.
-2) S'assurer que la base de données crunchbase et la collection artists existe.
+2) S'assurer que la base de données crunchbase et la collection artists existent.
 3) Lancer l'application FastAPI dans un terminal à l'emplacement du fichier main.py.
 5) Vous pouvez consulter et tester les endpoints.
 
@@ -20,5 +20,6 @@ Endpoints disponibles:
 
 Tous les endpoints sont disponibles via l'url: http://localhost:8000/docs.
   
-
+Installation des packages
+-> pip install -r requirements.txt
 
